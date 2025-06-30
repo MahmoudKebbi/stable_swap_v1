@@ -4,7 +4,6 @@ pragma solidity ^0.8.20;
 import "./StableSwapPool.sol";
 import "./LPToken.sol";
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import "./LiquidityMining.sol";
 
 /**
  * @title StableSwapFactory
@@ -23,9 +22,6 @@ contract StableSwapFactory is Ownable {
 
     // Mapping of token pair to pool address
     mapping(address => mapping(address => address)) public getPool;
-
-    // Mapping of pool to liquidity mining contract
-    mapping(address => address) public getPoolLiquidityMining;
 
     // Protocol fee collector
     address public feeCollector;
@@ -53,11 +49,7 @@ contract StableSwapFactory is Ownable {
         address token1,
         address lpToken
     );
-    event LiquidityMiningDeployed(
-        address indexed pool,
-        address liquidityMining,
-        address rewardToken
-    );
+
     event FeeCollectorSet(address feeCollector);
     event ProtocolFeeShareSet(uint256 protocolFeeShare);
     event DefaultParametersSet(
@@ -153,10 +145,7 @@ contract StableSwapFactory is Ownable {
 
         // Create LP token
         string memory lpName = string(
-            abi.encodePacked(
-                ERC20(token0).symbol(),
-                ERC20(token1).symbol()
-            )
+            abi.encodePacked(ERC20(token0).symbol(), ERC20(token1).symbol())
         );
         string memory lpSymbol = string(
             abi.encodePacked(
@@ -200,34 +189,6 @@ contract StableSwapFactory is Ownable {
 
         emit PoolCreated(pool, token0, token1, address(lpToken));
         return pool;
-    }
-
-    /**
-     * @notice Deploy a liquidity mining contract for an existing pool
-     * @param pool Address of the StableSwap pool
-     * @param rewardToken Address of the reward token
-     * @return liquidityMining Address of the liquidity mining contract
-     */
-    function deployLiquidityMining(
-        address pool,
-        address rewardToken
-    ) external returns (address liquidityMining) {
-        if (!isPoolFromFactory[pool]) revert PoolDoesNotExist();
-
-        StableSwapPool poolContract = StableSwapPool(pool);
-        address lpToken = address(poolContract.lpToken());
-
-        // Create liquidity mining contract
-        LiquidityMining mining = new LiquidityMining(lpToken, rewardToken);
-
-        // Transfer ownership to caller
-        mining.transferOwnership(msg.sender);
-
-        liquidityMining = address(mining);
-        getPoolLiquidityMining[pool] = liquidityMining;
-
-        emit LiquidityMiningDeployed(pool, liquidityMining, rewardToken);
-        return liquidityMining;
     }
 
     /**
