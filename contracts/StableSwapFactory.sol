@@ -3,7 +3,7 @@ pragma solidity ^0.8.20;
 
 import "./StableSwapPool.sol";
 import "./LPToken.sol";
-import "./extensions/LiquidityMining.sol";
+import "./LiquidityMining.sol";
 
 /**
  * @title StableSwapFactory
@@ -15,38 +15,47 @@ contract StableSwapFactory is Ownable {
 
     // Mapping of pool address to boolean indicating if it was created by this factory
     mapping(address => bool) public isPoolFromFactory;
-    
+
     // Array of all pools created
     address[] public allPools;
-    
+
     // Mapping of token pair to pool address
     mapping(address => mapping(address => address)) public getPool;
-    
+
     // Mapping of pool to liquidity mining contract
     mapping(address => address) public getPoolLiquidityMining;
-    
+
     // Protocol fee collector
     address public feeCollector;
-    
+
     // Protocol fee share (in basis points, 100 = 1%)
     uint256 public protocolFeeShare = 0; // Initially 0%
-    
+
     // Default fee parameters
     uint256 public defaultAmplification = 100 * 100; // A = 100
     uint256 public defaultBaseFee = 4e14; // 0.04%
     uint256 public defaultMinFee = 1e14; // 0.01%
     uint256 public defaultMaxFee = 1e16; // 1%
     uint256 public defaultVolatilityMultiplier = 1e17; // Scaling factor
-    
+
     // Custom errors
     error PoolAlreadyExists();
     error PoolDoesNotExist();
     error IdenticalAddresses();
     error InvalidFeeShare();
-    
+
     // Events
-    event PoolCreated(address indexed pool, address token0, address token1, address lpToken);
-    event LiquidityMiningDeployed(address indexed pool, address liquidityMining, address rewardToken);
+    event PoolCreated(
+        address indexed pool,
+        address token0,
+        address token1,
+        address lpToken
+    );
+    event LiquidityMiningDeployed(
+        address indexed pool,
+        address liquidityMining,
+        address rewardToken
+    );
     event FeeCollectorSet(address feeCollector);
     event ProtocolFeeShareSet(uint256 protocolFeeShare);
     event DefaultParametersSet(
@@ -74,9 +83,18 @@ contract StableSwapFactory is Ownable {
         address token0,
         address token1
     ) external returns (address pool) {
-        return _createPool(token0, token1, defaultAmplification, defaultBaseFee, defaultMinFee, defaultMaxFee, defaultVolatilityMultiplier);
+        return
+            _createPool(
+                token0,
+                token1,
+                defaultAmplification,
+                defaultBaseFee,
+                defaultMinFee,
+                defaultMaxFee,
+                defaultVolatilityMultiplier
+            );
     }
-    
+
     /**
      * @notice Creates a new StableSwap pool with custom parameters
      * @param token0 Address of the first token
@@ -97,9 +115,18 @@ contract StableSwapFactory is Ownable {
         uint256 maxFee,
         uint256 volatilityMultiplier
     ) external returns (address pool) {
-        return _createPool(token0, token1, a, baseFee, minFee, maxFee, volatilityMultiplier);
+        return
+            _createPool(
+                token0,
+                token1,
+                a,
+                baseFee,
+                minFee,
+                maxFee,
+                volatilityMultiplier
+            );
     }
-    
+
     /**
      * @notice Internal function to create a pool
      */
@@ -113,18 +140,34 @@ contract StableSwapFactory is Ownable {
         uint256 volatilityMultiplier
     ) internal returns (address pool) {
         if (tokenA == tokenB) revert IdenticalAddresses();
-        
+
         // Sort tokens to ensure deterministic pool addresses
-        (address token0, address token1) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
-        
+        (address token0, address token1) = tokenA < tokenB
+            ? (tokenA, tokenB)
+            : (tokenB, tokenA);
+
         // Check if pool already exists
         if (getPool[token0][token1] != address(0)) revert PoolAlreadyExists();
-        
+
         // Create LP token
-        string memory lpName = string(abi.encodePacked("StableSwap LP ", IERC20(token0).symbol(), "-", IERC20(token1).symbol()));
-        string memory lpSymbol = string(abi.encodePacked("sLP-", IERC20(token0).symbol(), "-", IERC20(token1).symbol()));
+        string memory lpName = string(
+            abi.encodePacked(
+                "StableSwap LP ",
+                ERC20(token0).symbol(),
+                "-",
+                ERC20(token1).symbol()
+            )
+        );
+        string memory lpSymbol = string(
+            abi.encodePacked(
+                "sLP-",
+                ERC20(token0).symbol(),
+                "-",
+                ERC20(token1).symbol()
+            )
+        );
         LPToken lpToken = new LPToken(lpName, lpSymbol, address(this));
-        
+
         // Create pool
         StableSwapPool newPool = new StableSwapPool(
             token0,
@@ -136,25 +179,25 @@ contract StableSwapFactory is Ownable {
             maxFee,
             volatilityMultiplier
         );
-        
+
         // Transfer LP token ownership to the pool
         lpToken.transferOwnership(address(newPool));
-        
+
         // Register the pool
         pool = address(newPool);
         isPoolFromFactory[pool] = true;
         getPool[token0][token1] = pool;
         getPool[token1][token0] = pool; // Add the reverse mapping too
         allPools.push(pool);
-        
+
         // Configure protocol fee if set
         if (protocolFeeShare > 0 && feeCollector != address(0)) {
             newPool.setProtocolFeeReceiver(feeCollector, protocolFeeShare);
         }
-        
+
         // Transfer pool ownership to msg.sender
         newPool.transferOwnership(msg.sender);
-        
+
         emit PoolCreated(pool, token0, token1, address(lpToken));
         return pool;
     }
@@ -170,19 +213,19 @@ contract StableSwapFactory is Ownable {
         address rewardToken
     ) external returns (address liquidityMining) {
         if (!isPoolFromFactory[pool]) revert PoolDoesNotExist();
-        
+
         StableSwapPool poolContract = StableSwapPool(pool);
         address lpToken = address(poolContract.lpToken());
-        
+
         // Create liquidity mining contract
         LiquidityMining mining = new LiquidityMining(lpToken, rewardToken);
-        
+
         // Transfer ownership to caller
         mining.transferOwnership(msg.sender);
-        
+
         liquidityMining = address(mining);
         getPoolLiquidityMining[pool] = liquidityMining;
-        
+
         emit LiquidityMiningDeployed(pool, liquidityMining, rewardToken);
         return liquidityMining;
     }
@@ -226,7 +269,7 @@ contract StableSwapFactory is Ownable {
         defaultMinFee = _minFee;
         defaultMaxFee = _maxFee;
         defaultVolatilityMultiplier = _volatilityMultiplier;
-        
+
         emit DefaultParametersSet(
             _amplification,
             _baseFee,
@@ -243,7 +286,7 @@ contract StableSwapFactory is Ownable {
     function allPoolsLength() external view returns (uint256) {
         return allPools.length;
     }
-    
+
     /**
      * @notice Get pool analytics
      * @param pool Address of the pool
@@ -253,27 +296,33 @@ contract StableSwapFactory is Ownable {
      * @return _fee Current fee
      * @return _amplification Current amplification coefficient
      */
-    function getPoolAnalytics(address pool) external view returns (
-        address[2] memory _tokens,
-        uint256[2] memory _balances,
-        uint256 _liquidity,
-        uint256 _fee,
-        uint256 _amplification
-    ) {
+    function getPoolAnalytics(
+        address pool
+    )
+        external
+        view
+        returns (
+            address[2] memory _tokens,
+            uint256[2] memory _balances,
+            uint256 _liquidity,
+            uint256 _fee,
+            uint256 _amplification
+        )
+    {
         if (!isPoolFromFactory[pool]) revert PoolDoesNotExist();
-        
+
         StableSwapPool poolContract = StableSwapPool(pool);
-        
+
         _tokens[0] = address(poolContract.token0());
         _tokens[1] = address(poolContract.token1());
-        
+
         _balances[0] = poolContract.balances(0);
         _balances[1] = poolContract.balances(1);
-        
+
         _liquidity = poolContract.lpToken().totalSupply();
         _fee = poolContract.calculateDynamicFee();
         _amplification = poolContract.getA();
-        
+
         return (_tokens, _balances, _liquidity, _fee, _amplification);
     }
 }
