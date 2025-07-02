@@ -9,7 +9,7 @@ import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
  * @title StableSwapFactory
  * @notice Factory contract for creating StableSwap pools with optional liquidity mining
  * @author MahmoudKebbi
- * date 2025-06-30 09:08:01
+ * 
  */
 contract StableSwapFactory is Ownable {
     using SafeERC20 for IERC20;
