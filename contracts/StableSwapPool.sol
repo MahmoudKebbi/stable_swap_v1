@@ -9,8 +9,6 @@ import "@openzeppelin/contracts/utils/Pausable.sol";
 import "./StableMath.sol";
 import "./LPToken.sol";
 
-
-
 /**
  * @title IERC677
  * @dev Interface for ERC677 token standard which extends ERC20 with transferAndCall
