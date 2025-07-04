@@ -359,61 +359,49 @@ contract StableSwapPool is ReentrancyGuard, Ownable, Pausable, ERC677Receiver {
         return lpAmount;
     }
 
-    /**
-     * @notice Remove liquidity from the pool
-     * @dev Burns LP tokens and returns underlying tokens
-     * @param lpAmount Amount of LP tokens to burn
-     * @param minAmount0 Minimum amount of token0 to receive
-     * @param minAmount1 Minimum amount of token1 to receive
-     * @param deadline Transaction deadline timestamp
-     * @return amount0 Amount of token0 returned
-     * @return amount1 Amount of token1 returned
-     */
-    function removeLiquidity(
-        uint256 lpAmount,
-        uint256 minAmount0,
-        uint256 minAmount1,
-        uint256 deadline
-    )
-        public
-        nonReentrant
-        whenNotPaused
-        returns (uint256 amount0, uint256 amount1)
-    {
-        if (!initialized) revert NotInitialized();
-        if (block.timestamp > deadline) revert DeadlineExpired();
-        if (lpAmount == 0) revert ZeroAmount();
+  function removeLiquidity(
+    uint256 lpAmount,
+    uint256 minAmount0,
+    uint256 minAmount1,
+    uint256 deadline
+) public nonReentrant whenNotPaused returns (uint256 amount0, uint256 amount1) {
+    if (!initialized) revert NotInitialized();
+    if (block.timestamp > deadline) revert DeadlineExpired();
+    if (lpAmount == 0) revert ZeroAmount();
 
-        // Update the amplification coefficient if it's changing
-        _updateAmplification();
+    // Update the amplification coefficient if it's changing
+    _updateAmplification();
 
-        // Update price accumulator
-        _updatePriceAccumulator();
+    // Update price accumulator
+    _updatePriceAccumulator();
 
-        uint256 totalSupply = lpToken.totalSupply();
+    uint256 totalSupply = lpToken.totalSupply();
 
-        // Calculate token amounts to return based on proportional share
-        amount0 = (balances[0] * lpAmount) / totalSupply;
-        amount1 = (balances[1] * lpAmount) / totalSupply;
+    // Calculate token amounts to return based on proportional share
+    amount0 = (balances[0] * lpAmount) / totalSupply;
+    amount1 = (balances[1] * lpAmount) / totalSupply;
 
-        // Check minimum amounts
-        if (amount0 < minAmount0 || amount1 < minAmount1)
-            revert SlippageTooHigh();
+    // Check minimum amounts
+    if (amount0 < minAmount0 || amount1 < minAmount1)
+        revert SlippageTooHigh();
 
-        // Update balances
-        balances[0] -= amount0;
-        balances[1] -= amount1;
+    // Update balances
+    balances[0] -= amount0;
+    balances[1] -= amount1;
 
-        // Burn LP tokens
-        lpToken.burn(msg.sender, lpAmount);
+    // First transfer LP tokens to the pool
+    lpToken.transferFrom(msg.sender, address(this), lpAmount);
+    
+    // // Then burn from the pool's own balance
+    // lpToken.burn(address(this), lpAmount);
 
-        // Transfer tokens to user
-        IERC20(address(token0)).safeTransfer(msg.sender, amount0);
-        IERC20(address(token1)).safeTransfer(msg.sender, amount1);
+    // Transfer tokens to user
+    IERC20(address(token0)).safeTransfer(msg.sender, amount0);
+    IERC20(address(token1)).safeTransfer(msg.sender, amount1);
 
-        emit RemoveLiquidity(msg.sender, amount0, amount1, lpAmount);
-        return (amount0, amount1);
-    }
+    emit RemoveLiquidity(msg.sender, amount0, amount1, lpAmount);
+    return (amount0, amount1);
+}
 
     /**
      * @notice Perform a token swap
