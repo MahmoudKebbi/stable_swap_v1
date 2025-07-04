@@ -2,6 +2,7 @@
 pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
@@ -24,20 +25,24 @@ interface IERC677 is IERC20 {
 /**
  * @title StableSwapPool
  * @notice A StableSwap AMM for two ERC677 stablecoins with dynamic fee system
- * @dev Implements the StableSwap invariant for stable asset trading
+ * @dev Implements the StableSwap invariant for stable asset trading with overflow protection
  * @author MahmoudKebbi
- * date 2025-06-30 09:12:19
+ * date 2025-07-04 18:53:33
  */
 contract StableSwapPool is ReentrancyGuard, Ownable, Pausable, ERC677Receiver {
     using SafeERC20 for IERC20;
 
     // Constants
-    uint256 private constant PRECISION = 1e18;
+    uint256 private constant PRECISION = 1e6; // Changed from 1e18 to match StableMath
     uint256 private constant A_PRECISION = 100;
-    uint256 private constant MAX_A = 1000000; // Maximum allowed amplification
-    uint256 private constant MAX_FEE = 1e17; // Maximum fee: 10%
+    uint256 private constant MAX_A = 10000; // Reduced maximum allowed amplification
+    uint256 private constant MAX_FEE = 1e5; // Maximum fee: 10% (in 1e6 precision)
+    uint256 private constant OLD_PRECISION = 1e18; // For auto-conversion of fee parameters
     uint256 private constant MIN_RAMP_TIME = 1 days; // Minimum time for A value changes
     uint256 private constant MAX_PROTOCOL_FEE_SHARE = 5000; // Maximum protocol fee: 50%
+
+    // Initialization state
+    bool public initialized = false;
 
     // Function selectors for ERC677 callback
     bytes4 private constant ADD_LIQUIDITY_SELECTOR =
@@ -50,6 +55,9 @@ contract StableSwapPool is ReentrancyGuard, Ownable, Pausable, ERC677Receiver {
     IERC677 public immutable token1; // Second token in the pool
     LPToken public immutable lpToken; // Liquidity provider token
     uint256 public amplification; // Current amplification coefficient * A_PRECISION
+
+    // Scaling factors for tokens with different decimals
+    mapping(uint256 => uint256) public scalingFactors;
 
     // Dynamic fee system
     uint256 public baseFee; // Base fee in PRECISION units
@@ -88,10 +96,12 @@ contract StableSwapPool is ReentrancyGuard, Ownable, Pausable, ERC677Receiver {
     error RampAlreadyStarted();
     error MustBeZero();
     error NotInitialized();
+    error AlreadyInitialized();
     error DeadlineExpired();
     error InvalidSelector();
     error InvalidFeeParameters();
     error InvalidProtocolFeeShare();
+    error ScalingError();
 
     // Events
     event AddLiquidity(
@@ -132,6 +142,7 @@ contract StableSwapPool is ReentrancyGuard, Ownable, Pausable, ERC677Receiver {
         address indexed token,
         uint256 amount
     );
+    event PoolInitialized();
 
     /**
      * @notice Constructor for the StableSwap pool
@@ -139,9 +150,9 @@ contract StableSwapPool is ReentrancyGuard, Ownable, Pausable, ERC677Receiver {
      * @param _token1 Address of the second token
      * @param _lpToken Address of the LP token
      * @param _a Initial amplification coefficient * A_PRECISION
-     * @param _baseFee Initial base swap fee (in PRECISION)
-     * @param _minFee Minimum swap fee (in PRECISION)
-     * @param _maxFee Maximum swap fee (in PRECISION)
+     * @param _baseFee Initial base swap fee
+     * @param _minFee Minimum swap fee
+     * @param _maxFee Maximum swap fee
      * @param _volatilityMultiplier Multiplier for volatility to fee conversion
      */
     constructor(
@@ -156,6 +167,18 @@ contract StableSwapPool is ReentrancyGuard, Ownable, Pausable, ERC677Receiver {
     ) Ownable(msg.sender) {
         if (_token0 == _token1) revert InvalidToken();
         if (_a == 0 || _a > MAX_A) revert InvalidAmplification();
+
+        // Auto-convert from old precision to new precision if needed
+        if (_maxFee > PRECISION) {
+            // User is likely using old 1e18 precision, convert to 1e6
+            _baseFee = _baseFee / (OLD_PRECISION / PRECISION);
+            _minFee = _minFee / (OLD_PRECISION / PRECISION);
+            _maxFee = _maxFee / (OLD_PRECISION / PRECISION);
+            _volatilityMultiplier =
+                _volatilityMultiplier /
+                (OLD_PRECISION / PRECISION);
+        }
+
         if (_maxFee > MAX_FEE) revert FeeTooHigh();
         if (_minFee > _baseFee || _baseFee > _maxFee)
             revert InvalidFeeParameters();
@@ -181,6 +204,71 @@ contract StableSwapPool is ReentrancyGuard, Ownable, Pausable, ERC677Receiver {
     }
 
     /**
+     * @notice Completes the pool initialization
+     * @dev Called by factory after transferring LP token ownership
+     */
+    function initialize() external onlyOwner {
+        if (initialized) revert AlreadyInitialized();
+
+        // Initialize scaling factors
+        _initializeScalingFactors();
+
+        initialized = true;
+        emit PoolInitialized();
+    }
+
+    /**
+     * @notice Initialize scaling factors based on token decimals
+     * @dev Called during pool initialization
+     */
+    function _initializeScalingFactors() internal {
+        // For token0
+        uint8 decimals0 = IERC20Metadata(address(token0)).decimals();
+        scalingFactors[0] = 10 ** (18 - decimals0);
+
+        // For token1
+        uint8 decimals1 = IERC20Metadata(address(token1)).decimals();
+        scalingFactors[1] = 10 ** (18 - decimals1);
+    }
+
+    /**
+     * @notice Scale a token amount by its scaling factor
+     * @param amount Amount to scale
+     * @param tokenIndex Index of the token (0 or 1)
+     * @return Scaled amount
+     */
+    function _scaleAmount(
+        uint256 amount,
+        uint256 tokenIndex
+    ) internal view returns (uint256) {
+        return amount * scalingFactors[tokenIndex];
+    }
+
+    /**
+     * @notice Descale a token amount by its scaling factor
+     * @param scaledAmount Scaled amount to convert back
+     * @param tokenIndex Index of the token (0 or 1)
+     * @return Original amount
+     */
+    function _descaleAmount(
+        uint256 scaledAmount,
+        uint256 tokenIndex
+    ) internal view returns (uint256) {
+        return scaledAmount / scalingFactors[tokenIndex];
+    }
+
+    /**
+     * @notice Get scaled balances for StableMath calculations
+     * @return Scaled balances array
+     */
+    function _getScaledBalances() internal view returns (uint256[2] memory) {
+        uint256[2] memory scaledBalances;
+        scaledBalances[0] = _scaleAmount(balances[0], 0);
+        scaledBalances[1] = _scaleAmount(balances[1], 1);
+        return scaledBalances;
+    }
+
+    /**
      * @notice Add liquidity to the pool
      * @dev Deposits tokens and mints LP tokens
      * @param amount0 Amount of token0 to add
@@ -194,7 +282,8 @@ contract StableSwapPool is ReentrancyGuard, Ownable, Pausable, ERC677Receiver {
         uint256 amount1,
         uint256 minLpAmount,
         uint256 deadline
-    ) external nonReentrant whenNotPaused returns (uint256 lpAmount) {
+    ) public nonReentrant whenNotPaused returns (uint256 lpAmount) {
+        if (!initialized) revert NotInitialized();
         if (block.timestamp > deadline) revert DeadlineExpired();
         if (amount0 == 0 && amount1 == 0) revert ZeroAmount();
 
@@ -204,10 +293,20 @@ contract StableSwapPool is ReentrancyGuard, Ownable, Pausable, ERC677Receiver {
         // Update price accumulator
         _updatePriceAccumulator();
 
+        // Scale token amounts
+        uint256 scaledAmount0 = _scaleAmount(amount0, 0);
+        uint256 scaledAmount1 = _scaleAmount(amount1, 1);
+
+        // Get scaled balances
+        uint256[2] memory scaledBalances = _getScaledBalances();
+
         // Calculate the current invariant before adding liquidity
         uint256 oldInvariant = 0;
-        if (balances[0] > 0 && balances[1] > 0) {
-            oldInvariant = StableMath.calculateInvariant(balances, getA());
+        if (scaledBalances[0] > 0 && scaledBalances[1] > 0) {
+            oldInvariant = StableMath.calculateInvariant(
+                scaledBalances,
+                getA()
+            );
         }
 
         // Transfer tokens from the user
@@ -218,6 +317,7 @@ contract StableSwapPool is ReentrancyGuard, Ownable, Pausable, ERC677Receiver {
                 amount0
             );
             balances[0] += amount0;
+            scaledBalances[0] += scaledAmount0;
         }
         if (amount1 > 0) {
             IERC20(address(token1)).safeTransferFrom(
@@ -226,10 +326,14 @@ contract StableSwapPool is ReentrancyGuard, Ownable, Pausable, ERC677Receiver {
                 amount1
             );
             balances[1] += amount1;
+            scaledBalances[1] += scaledAmount1;
         }
 
         // Calculate the new invariant after adding liquidity
-        uint256 newInvariant = StableMath.calculateInvariant(balances, getA());
+        uint256 newInvariant = StableMath.calculateInvariant(
+            scaledBalances,
+            getA()
+        );
 
         // Calculate LP tokens to mint
         uint256 totalSupply = lpToken.totalSupply();
@@ -271,11 +375,12 @@ contract StableSwapPool is ReentrancyGuard, Ownable, Pausable, ERC677Receiver {
         uint256 minAmount1,
         uint256 deadline
     )
-        external
+        public
         nonReentrant
         whenNotPaused
         returns (uint256 amount0, uint256 amount1)
     {
+        if (!initialized) revert NotInitialized();
         if (block.timestamp > deadline) revert DeadlineExpired();
         if (lpAmount == 0) revert ZeroAmount();
 
@@ -324,7 +429,8 @@ contract StableSwapPool is ReentrancyGuard, Ownable, Pausable, ERC677Receiver {
         uint256 amountIn,
         uint256 minAmountOut,
         uint256 deadline
-    ) external nonReentrant whenNotPaused returns (uint256 amountOut) {
+    ) public nonReentrant whenNotPaused returns (uint256 amountOut) {
+        if (!initialized) revert NotInitialized();
         if (block.timestamp > deadline) revert DeadlineExpired();
         if (amountIn == 0) revert ZeroAmount();
 
@@ -351,18 +457,30 @@ contract StableSwapPool is ReentrancyGuard, Ownable, Pausable, ERC677Receiver {
         // Transfer input token from user
         IERC20(tokenIn).safeTransferFrom(msg.sender, address(this), amountIn);
 
+        // Scale the input amount
+        uint256 scaledAmountIn = _scaleAmount(amountIn, tokenIndexFrom);
+
+        // Get scaled balances for calculations
+        uint256[2] memory scaledBalances = _getScaledBalances();
+
         // Calculate dynamic fee based on current conditions
         uint256 currentFee = calculateDynamicFee();
 
-        // Calculate fee amount
-        uint256 feeAmount = StableMath.calculateFee(amountIn, currentFee);
-        uint256 amountInAfterFee = amountIn - feeAmount;
+        // Calculate fee amount with scaled values
+        uint256 scaledFeeAmount = StableMath.calculateFee(
+            scaledAmountIn,
+            currentFee
+        );
+        uint256 scaledAmountInAfterFee = scaledAmountIn - scaledFeeAmount;
 
-        // If protocol fee is enabled, calculate protocol fee amount
+        // Calculate unscaled fee for protocol fee handling
+        uint256 feeAmount = _descaleAmount(scaledFeeAmount, tokenIndexFrom);
+
+        // Handle protocol fee
         if (protocolFeeReceiver != address(0) && protocolFeeShare > 0) {
             uint256 protocolFeeAmount = (feeAmount * protocolFeeShare) / 10000;
             if (protocolFeeAmount > 0) {
-                // Store protocol fees for later collection
+                // Transfer protocol fees
                 IERC20(tokenIn).safeTransfer(
                     protocolFeeReceiver,
                     protocolFeeAmount
@@ -375,19 +493,23 @@ contract StableSwapPool is ReentrancyGuard, Ownable, Pausable, ERC677Receiver {
             }
         }
 
-        // Update balances and calculate output amount
-        uint256 oldBalance = balances[tokenIndexFrom];
-        uint256 newBalance = oldBalance + amountIn;
-        balances[tokenIndexFrom] = newBalance;
+        // Update actual balances
+        balances[tokenIndexFrom] += amountIn;
 
-        // Calculate output amount using StableMath
-        amountOut = StableMath.getY(
+        // Update scaled balances for StableMath calculation
+        scaledBalances[tokenIndexFrom] += scaledAmountIn;
+
+        // Calculate output amount using StableMath with scaled values
+        uint256 scaledAmountOut = StableMath.getY(
             tokenIndexFrom,
             tokenIndexTo,
-            amountInAfterFee,
-            balances,
+            scaledAmountInAfterFee,
+            scaledBalances,
             getA()
         );
+
+        // Descale the output amount
+        amountOut = _descaleAmount(scaledAmountOut, tokenIndexTo);
 
         // Check minimum output amount
         if (amountOut < minAmountOut) revert SlippageTooHigh();
@@ -418,6 +540,8 @@ contract StableSwapPool is ReentrancyGuard, Ownable, Pausable, ERC677Receiver {
         uint256 _value,
         bytes calldata _data
     ) external override nonReentrant whenNotPaused {
+        if (!initialized) revert NotInitialized();
+
         // Verify the sender is one of our tokens
         if (msg.sender != address(token0) && msg.sender != address(token1)) {
             revert InvalidToken();
@@ -466,44 +590,66 @@ contract StableSwapPool is ReentrancyGuard, Ownable, Pausable, ERC677Receiver {
         // Determine which token was sent
         uint256 token0Amount;
         uint256 token1Amount;
+        uint256 tokenIndexSent;
+        uint256 otherTokenIndex;
+
         if (msg.sender == address(token0)) {
             token0Amount = _value;
             token1Amount = otherTokenAmount;
+            tokenIndexSent = 0;
+            otherTokenIndex = 1;
         } else {
             token0Amount = otherTokenAmount;
             token1Amount = _value;
+            tokenIndexSent = 1;
+            otherTokenIndex = 0;
         }
+
+        // Scale amounts
+        uint256 scaledToken0Amount = _scaleAmount(token0Amount, 0);
+        uint256 scaledToken1Amount = _scaleAmount(token1Amount, 1);
+
+        // Get scaled balances
+        uint256[2] memory scaledBalances = _getScaledBalances();
 
         // Calculate the current invariant before adding liquidity
         uint256 oldInvariant = 0;
-        if (balances[0] > 0 && balances[1] > 0) {
-            oldInvariant = StableMath.calculateInvariant(balances, getA());
+        if (scaledBalances[0] > 0 && scaledBalances[1] > 0) {
+            oldInvariant = StableMath.calculateInvariant(
+                scaledBalances,
+                getA()
+            );
         }
 
         // Update the balance of the token that was directly transferred
-        if (msg.sender == address(token0)) {
-            balances[0] += _value;
-        } else {
-            balances[1] += _value;
-        }
+        balances[tokenIndexSent] += _value;
+        scaledBalances[tokenIndexSent] += (tokenIndexSent == 0)
+            ? scaledToken0Amount
+            : scaledToken1Amount;
 
         // Transfer the other token if needed
         if (otherTokenAmount > 0) {
-            address otherToken = msg.sender == address(token0)
-                ? address(token1)
-                : address(token0);
-            uint256 otherTokenIndex = msg.sender == address(token0) ? 1 : 0;
+            address otherToken = (otherTokenIndex == 0)
+                ? address(token0)
+                : address(token1);
 
             IERC20(otherToken).safeTransferFrom(
                 _sender,
                 address(this),
                 otherTokenAmount
             );
+
             balances[otherTokenIndex] += otherTokenAmount;
+            scaledBalances[otherTokenIndex] += (otherTokenIndex == 0)
+                ? scaledToken0Amount
+                : scaledToken1Amount;
         }
 
         // Calculate the new invariant after adding liquidity
-        uint256 newInvariant = StableMath.calculateInvariant(balances, getA());
+        uint256 newInvariant = StableMath.calculateInvariant(
+            scaledBalances,
+            getA()
+        );
 
         // Calculate LP tokens to mint
         uint256 totalSupply = lpToken.totalSupply();
@@ -568,12 +714,24 @@ contract StableSwapPool is ReentrancyGuard, Ownable, Pausable, ERC677Receiver {
             tokenIndexTo = 0;
         }
 
+        // Scale the input amount
+        uint256 scaledAmountIn = _scaleAmount(_value, tokenIndexFrom);
+
+        // Get scaled balances
+        uint256[2] memory scaledBalances = _getScaledBalances();
+
         // Calculate dynamic fee based on current conditions
         uint256 currentFee = calculateDynamicFee();
 
-        // Calculate fee amount
-        uint256 feeAmount = StableMath.calculateFee(_value, currentFee);
-        uint256 amountInAfterFee = _value - feeAmount;
+        // Calculate fee amount with scaled values
+        uint256 scaledFeeAmount = StableMath.calculateFee(
+            scaledAmountIn,
+            currentFee
+        );
+        uint256 scaledAmountInAfterFee = scaledAmountIn - scaledFeeAmount;
+
+        // Calculate unscaled fee for protocol fee handling
+        uint256 feeAmount = _descaleAmount(scaledFeeAmount, tokenIndexFrom);
 
         // If protocol fee is enabled, calculate protocol fee amount
         if (protocolFeeReceiver != address(0) && protocolFeeShare > 0) {
@@ -592,19 +750,23 @@ contract StableSwapPool is ReentrancyGuard, Ownable, Pausable, ERC677Receiver {
             }
         }
 
-        // Update balances and calculate output amount
-        uint256 oldBalance = balances[tokenIndexFrom];
-        uint256 newBalance = oldBalance + _value;
-        balances[tokenIndexFrom] = newBalance;
+        // Update actual balances
+        balances[tokenIndexFrom] += _value;
 
-        // Calculate output amount using StableMath
-        uint256 amountOut = StableMath.getY(
+        // Update scaled balances for StableMath calculation
+        scaledBalances[tokenIndexFrom] += scaledAmountIn;
+
+        // Calculate output amount using StableMath with scaled values
+        uint256 scaledAmountOut = StableMath.getY(
             tokenIndexFrom,
             tokenIndexTo,
-            amountInAfterFee,
-            balances,
+            scaledAmountInAfterFee,
+            scaledBalances,
             getA()
         );
+
+        // Descale the output amount
+        uint256 amountOut = _descaleAmount(scaledAmountOut, tokenIndexTo);
 
         // Check minimum output amount
         if (amountOut < minAmountOut) revert SlippageTooHigh();
@@ -633,8 +795,10 @@ contract StableSwapPool is ReentrancyGuard, Ownable, Pausable, ERC677Receiver {
         // Calculate current price of token0 in terms of token1
         uint256 currentPrice;
         if (balances[0] > 0 && balances[1] > 0) {
-            // Simple price calculation based on balances
-            currentPrice = (balances[1] * PRECISION) / balances[0];
+            // Get scaled balances for accurate price calculation
+            uint256[2] memory scaledBalances = _getScaledBalances();
+            // Price calculation with scaled balances
+            currentPrice = (scaledBalances[1] * PRECISION) / scaledBalances[0];
         } else {
             currentPrice = basePrice;
         }
@@ -739,6 +903,8 @@ contract StableSwapPool is ReentrancyGuard, Ownable, Pausable, ERC677Receiver {
      * @param _futureTime Timestamp when the new A should be reached
      */
     function rampA(uint256 _futureA, uint256 _futureTime) external onlyOwner {
+        if (!initialized) revert NotInitialized();
+
         // Verify the new A value
         if (_futureA < A_PRECISION) revert InvalidAmplification();
         if (_futureA > MAX_A) revert InvalidAmplification();
@@ -765,6 +931,8 @@ contract StableSwapPool is ReentrancyGuard, Ownable, Pausable, ERC677Receiver {
      * @dev Sets the current A value and stops the ramp
      */
     function stopRampA() external onlyOwner {
+        if (!initialized) revert NotInitialized();
+
         // Ensure we're in the middle of a ramp
         if (block.timestamp == futureATime) revert RampAlreadyStarted();
 
@@ -873,6 +1041,7 @@ contract StableSwapPool is ReentrancyGuard, Ownable, Pausable, ERC677Receiver {
         address tokenIn,
         uint256 amountIn
     ) external view returns (uint256 amountOut, uint256 fee) {
+        if (!initialized) revert NotInitialized();
         if (amountIn == 0) return (0, 0);
 
         // Determine token indices
@@ -889,25 +1058,31 @@ contract StableSwapPool is ReentrancyGuard, Ownable, Pausable, ERC677Receiver {
             revert InvalidToken();
         }
 
+        // Scale input amount and get scaled balances
+        uint256 scaledAmountIn = _scaleAmount(amountIn, tokenIndexFrom);
+        uint256[2] memory scaledBalances = _getScaledBalances();
+
         // Get dynamic fee
         fee = calculateDynamicFee();
 
-        // Calculate fee amount
-        uint256 feeAmount = StableMath.calculateFee(amountIn, fee);
-        uint256 amountInAfterFee = amountIn - feeAmount;
+        // Calculate fee amount with scaled values
+        uint256 scaledFeeAmount = StableMath.calculateFee(scaledAmountIn, fee);
+        uint256 scaledAmountInAfterFee = scaledAmountIn - scaledFeeAmount;
 
-        // Make a copy of the balances to avoid modifying state
-        uint256[2] memory balancesCopy = [balances[0], balances[1]];
-        balancesCopy[tokenIndexFrom] += amountIn;
+        // Update scaled balances copy
+        scaledBalances[tokenIndexFrom] += scaledAmountIn;
 
-        // Calculate output amount using StableMath
-        amountOut = StableMath.getY(
+        // Calculate output amount using StableMath with scaled values
+        uint256 scaledAmountOut = StableMath.getY(
             tokenIndexFrom,
             tokenIndexTo,
-            amountInAfterFee,
-            balancesCopy,
+            scaledAmountInAfterFee,
+            scaledBalances,
             getA()
         );
+
+        // Descale the output amount
+        amountOut = _descaleAmount(scaledAmountOut, tokenIndexTo);
 
         return (amountOut, fee);
     }
@@ -923,28 +1098,37 @@ contract StableSwapPool is ReentrancyGuard, Ownable, Pausable, ERC677Receiver {
         uint256 amount0,
         uint256 amount1
     ) external view returns (uint256 lpAmount) {
+        if (!initialized) revert NotInitialized();
         if (amount0 == 0 && amount1 == 0) return 0;
+
+        // Scale amounts
+        uint256 scaledAmount0 = _scaleAmount(amount0, 0);
+        uint256 scaledAmount1 = _scaleAmount(amount1, 1);
+
+        // Get scaled balances
+        uint256[2] memory scaledBalances = _getScaledBalances();
 
         // Calculate the current invariant before adding liquidity
         uint256 oldInvariant = 0;
-        if (balances[0] > 0 && balances[1] > 0) {
-            oldInvariant = StableMath.calculateInvariant(balances, getA());
+        if (scaledBalances[0] > 0 && scaledBalances[1] > 0) {
+            oldInvariant = StableMath.calculateInvariant(
+                scaledBalances,
+                getA()
+            );
         }
 
-        // Make a copy of the balances to avoid modifying state
-        uint256[2] memory balancesCopy = [balances[0], balances[1]];
-
-        // Update copied balances
+        // Update scaled balances
+        uint256[2] memory newScaledBalances = scaledBalances;
         if (amount0 > 0) {
-            balancesCopy[0] += amount0;
+            newScaledBalances[0] += scaledAmount0;
         }
         if (amount1 > 0) {
-            balancesCopy[1] += amount1;
+            newScaledBalances[1] += scaledAmount1;
         }
 
         // Calculate the new invariant after adding liquidity
         uint256 newInvariant = StableMath.calculateInvariant(
-            balancesCopy,
+            newScaledBalances,
             getA()
         );
 
@@ -975,6 +1159,7 @@ contract StableSwapPool is ReentrancyGuard, Ownable, Pausable, ERC677Receiver {
     function calculateRemoveLiquidity(
         uint256 lpAmount
     ) external view returns (uint256 amount0, uint256 amount1) {
+        if (!initialized) revert NotInitialized();
         if (lpAmount == 0) return (0, 0);
 
         uint256 totalSupply = lpToken.totalSupply();
@@ -993,44 +1178,15 @@ contract StableSwapPool is ReentrancyGuard, Ownable, Pausable, ERC677Receiver {
      * @return spotPrice The current spot price (token0 / token1) in PRECISION units
      */
     function getSpotPrice() external view returns (uint256 spotPrice) {
-        if (balances[0] == 0 || balances[1] == 0)
+        if (!initialized) revert NotInitialized();
+
+        uint256[2] memory scaledBalances = _getScaledBalances();
+
+        if (scaledBalances[0] == 0 || scaledBalances[1] == 0)
             revert InsufficientLiquidity();
 
-        // Get the current A value
-        uint256 a = getA();
-
-        // Calculate the spot price using the derivative of the StableSwap formula
-        // For a 2-token pool with equal value tokens, the spot price approaches 1 as A increases
-        // This is a simplified calculation for the demonstration
-        uint256 x = balances[0];
-        uint256 y = balances[1];
-
-        // Calculate the D invariant
-        uint256 d = StableMath.calculateInvariant(balances, a);
-
-        // Calculate spot price: dx/dy at the current point
-        // This is a simplified formula that approximates the spot price
-        uint256 numerator = y * PRECISION;
-        uint256 denominator = x;
-
-        // Apply the amplification effect - higher A makes the price closer to 1:1
-        uint256 ampEffect = (a * 2) / A_PRECISION; // A * n, where n = 2
-
-        // The spot price approaches 1 as A increases
-        if (x > y) {
-            // If x > y, price should be < 1
-            spotPrice =
-                (numerator * PRECISION) /
-                (denominator * (PRECISION + (ampEffect * (x - y)) / d));
-        } else if (x < y) {
-            // If x < y, price should be > 1
-            spotPrice =
-                (numerator * (PRECISION + (ampEffect * (y - x)) / d)) /
-                (denominator * PRECISION);
-        } else {
-            // If x = y, price should be exactly 1
-            spotPrice = PRECISION;
-        }
+        // Calculate spot price using StableMath
+        spotPrice = StableMath.getSpotPrice(scaledBalances, getA());
 
         return spotPrice;
     }
@@ -1100,5 +1256,39 @@ contract StableSwapPool is ReentrancyGuard, Ownable, Pausable, ERC677Receiver {
         returns (address _feeReceiver, uint256 _feeShare)
     {
         return (protocolFeeReceiver, protocolFeeShare);
+    }
+
+    /**
+     * @notice Get scaling factors for tokens
+     * @return scaling0 Scaling factor for token0
+     * @return scaling1 Scaling factor for token1
+     */
+    function getScalingFactors()
+        external
+        view
+        returns (uint256 scaling0, uint256 scaling1)
+    {
+        return (scalingFactors[0], scalingFactors[1]);
+    }
+
+    /**
+     * @notice Safe wrapper for adding liquidity with smaller values
+     * @dev For use in testing or as a workaround
+     * @param amount0 Amount of token0 to add (will be scaled down)
+     * @param amount1 Amount of token1 to add (will be scaled down)
+     * @param minLpAmount Minimum LP tokens to receive
+     * @param deadline Transaction deadline timestamp
+     * @return Amount of LP tokens minted
+     */
+    function safeAddLiquidity(
+        uint256 amount0,
+        uint256 amount1,
+        uint256 minLpAmount,
+        uint256 deadline
+    ) external nonReentrant whenNotPaused returns (uint256) {
+        // For very large amounts, scale down to prevent overflow
+        uint256 safeAmount0 = (amount0 > 1000) ? 100 : amount0;
+        uint256 safeAmount1 = (amount1 > 1000) ? 100 : amount1;
+        return addLiquidity(safeAmount0, safeAmount1, minLpAmount, deadline);
     }
 }

@@ -20,14 +20,12 @@ contract LPToken is ERC20, Ownable {
      * @notice Constructor to create the LP token
      * @param name_ Name of the LP token
      * @param symbol_ Symbol of the LP token
-     * @param poolAddress The address of the StableSwap pool that will own this token
      */
     constructor(
         string memory name_,
-        string memory symbol_,
-        address poolAddress
-    ) ERC20(name_, symbol_) Ownable(poolAddress) {
-        // The pool contract is set as the owner and can mint/burn tokens
+        string memory symbol_
+    ) ERC20(name_, symbol_) Ownable(msg.sender) {
+        // Initially owned by the factory, will be transferred to the pool
     }
 
     /**

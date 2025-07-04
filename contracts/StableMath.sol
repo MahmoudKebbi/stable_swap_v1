@@ -3,43 +3,72 @@ pragma solidity ^0.8.20;
 
 /**
  * @title StableMath
- * @notice This library contains the math functions for the StableSwap invariant
- * calculations with fixes for overflow issues.
+ * @notice Math library for StableSwap operations with overflow protection
+ * and support for tokens with different decimal places.
  */
 library StableMath {
-    // Precision for A and other calculations
+    // ================ Constants ================
+
+    // Use lower precision to prevent overflow
     uint256 internal constant A_PRECISION = 100;
-    
-    // Maximum allowed amplification coefficient
-    uint256 internal constant MAX_A = 1000000;
-    
-    // Maximum allowed number of iterations
-    uint256 internal constant MAX_ITERATIONS = 255;
-    
-    // Reduced precision for fixed-point calculations to prevent overflow
-    // Changed from 1e18 to 1e8 to prevent arithmetic overflow
-    uint256 internal constant PRECISION = 1e8;
-    
-    // Custom errors are more gas efficient than string error messages
+
+    // Maximum allowed amplification coefficient (reduced from previous value)
+    uint256 internal constant MAX_A = 10000;
+
+    // Maximum allowed number of iterations for convergence
+    uint256 internal constant MAX_ITERATIONS = 32;
+
+    // Precision for fixed-point calculations (reduced from 1e18)
+    uint256 internal constant PRECISION = 1e6;
+
+    // ================ Custom Errors ================
+
     error InvalidAmplification();
     error SameTokenIndices();
     error InvalidTokenIndex();
     error OutputExceedsBalance();
+    error DidNotConverge();
+
+    // ================ Core Math Functions ================
+
+    /**
+     * @notice Safe multiplication to prevent overflow
+     */
+    function mulDown(uint256 a, uint256 b) internal pure returns (uint256) {
+        return (a * b) / PRECISION;
+    }
+
+    /**
+     * @notice Safe division with rounding down
+     */
+    function divDown(uint256 a, uint256 b) internal pure returns (uint256) {
+        if (b == 0) return 0;
+        return (a * PRECISION) / b;
+    }
+
+    /**
+     * @notice Safe division with rounding up
+     */
+    function divUp(uint256 a, uint256 b) internal pure returns (uint256) {
+        if (b == 0) return 0;
+
+        // Equivalent to ceil(a * PRECISION / b)
+        return (a * PRECISION + b - 1) / b;
+    }
 
     /**
      * @notice Calculate the StableSwap invariant (D)
-     * @dev Iteratively calculates the invariant D for the StableSwap formula
-     * @param balances Array of token balances
+     * @param balances Array of token balances (already scaled by their respective factors)
      * @param amplification Amplification coefficient (A) - scaled by A_PRECISION
      * @return D The invariant value
      */
-    function calculateInvariant(uint256[2] memory balances, uint256 amplification) 
-        public 
-        pure 
-        returns (uint256 D) 
-    {
+    function calculateInvariant(
+        uint256[2] memory balances,
+        uint256 amplification
+    ) public pure returns (uint256 D) {
         // Verify amplification is within limits
-        if (amplification == 0 || amplification > MAX_A) revert InvalidAmplification();
+        if (amplification == 0 || amplification > MAX_A)
+            revert InvalidAmplification();
 
         uint256 sum = balances[0] + balances[1];
         if (sum == 0) return 0;
@@ -49,40 +78,50 @@ library StableMath {
         D = sum;
 
         // Amplification coefficient A in the StableSwap formula
-        // Simplified for n=2 case: Ann = A * n = A * 2
+        // Ann = A * n^(n-1) = A * 2 for n=2
         uint256 Ann = amplification * 2;
 
-        for (uint256 i = 0; i < MAX_ITERATIONS;) {
-            uint256 D_P = D;
-            
-            // Calculate D_P = D^3 / (x_0 * x_1 * n^n)
-            // For n=2, this simplifies to: D^3 / (x_0 * x_1 * 4)
-            // Added overflow protection by checking for zero values
-            if (balances[0] == 0 || balances[1] == 0) {
-                D_P = 0;
+        for (uint256 i = 0; i < MAX_ITERATIONS; ) {
+            // Break down calculations to prevent overflow
+
+            // Calculate D_P = D^3 / (x_0 * x_1 * 4)
+            uint256 D_P;
+
+            if (balances[0] > 0 && balances[1] > 0) {
+                // Calculate step by step with safe operations
+                uint256 balancesProduct = balances[0] * balances[1];
+                if (balancesProduct > 0) {
+                    uint256 d_squared = D * D; // Changed from 'numerator' to 'd_squared'
+                    D_P = ((d_squared / balancesProduct) * D) / 4;
+                } else {
+                    D_P = 0;
+                }
             } else {
-                // Calculate with safeguards against division by zero
-                uint256 temp = (D * D) / (balances[0] * 2);
-                D_P = (temp * D) / (balances[1] * 2);
+                D_P = 0;
             }
 
             D_prev = D;
-            
-            // Modified formula to prevent overflow - removed PRECISION multiplication
-            // Original: D = (Ann * sum * PRECISION + D_P * 2) * D / ((Ann - 1) * D + 3 * D_P);
-            
-            // Step 1: Calculate numerator parts separately to avoid overflow
+
+            // D = (Ann * sum + D_P * n) * D / ((Ann - 1) * D + (n + 1) * D_P)
+            // For n=2, this simplifies to the calculation below
+
+            // Calculate parts separately to avoid overflow
             uint256 numerator1 = Ann * sum;
             uint256 numerator2 = D_P * 2;
-            
-            // Step 2: Calculate denominator parts separately
+            uint256 numerator = (numerator1 + numerator2) * D;
+
             uint256 denominator1 = (Ann - 1) * D;
             uint256 denominator2 = 3 * D_P;
-            
-            // Step 3: Calculate final value with overflow protection
-            D = ((numerator1 + numerator2) * D) / (denominator1 + denominator2);
+            uint256 denominator = denominator1 + denominator2;
 
-            // Check if we've converged with an optimized absolute difference check
+            // Prevent division by zero
+            if (denominator > 0) {
+                D = numerator / denominator;
+            } else {
+                break; // Unable to calculate further
+            }
+
+            // Check if we've converged
             if (D > D_prev) {
                 if (D - D_prev <= 1) {
                     break;
@@ -92,9 +131,10 @@ library StableMath {
                     break;
                 }
             }
-            
-            // Gas optimization for loops - avoid using ++ operator
-            unchecked { ++i; }
+
+            unchecked {
+                ++i;
+            }
         }
 
         return D;
@@ -102,13 +142,12 @@ library StableMath {
 
     /**
      * @notice Calculate the output amount (Y) when swapping
-     * @dev Calculates the token output amount for a swap to maintain the invariant D
      * @param tokenIndexFrom Index of input token (0 or 1)
      * @param tokenIndexTo Index of output token (0 or 1)
-     * @param amountIn Amount of input token
-     * @param balances Current balances of both tokens
+     * @param amountIn Amount of input token (already scaled)
+     * @param balances Current balances of both tokens (already scaled)
      * @param amplification Amplification coefficient
-     * @return Amount of output token (Y)
+     * @return Amount of output token (scaled)
      */
     function getY(
         uint256 tokenIndexFrom,
@@ -118,75 +157,77 @@ library StableMath {
         uint256 amplification
     ) public pure returns (uint256) {
         if (tokenIndexFrom == tokenIndexTo) revert SameTokenIndices();
-        if (tokenIndexFrom >= 2 || tokenIndexTo >= 2) revert InvalidTokenIndex();
-        
+        if (tokenIndexFrom >= 2 || tokenIndexTo >= 2)
+            revert InvalidTokenIndex();
+
         // Calculate the invariant D with current balances
         uint256 D = calculateInvariant(balances, amplification);
-        
+
         // Update the balance of the input token
         uint256 newBalanceFrom = balances[tokenIndexFrom] + amountIn;
         uint256 Ann = amplification * 2;
-        
-        // Calculate c = D^3 / (4 * A * x_0) with overflow protection
-        uint256 c;
-        if (newBalanceFrom > 0) {
-            uint256 temp = D * D / (newBalanceFrom * 2);
-            c = temp * D / (Ann * 2);
-        } else {
-            c = 0;
+
+        // Solve for the new balance of the output token that maintains the invariant
+
+        // Calculate c = D^3 / (4 * A * x_0)
+        uint256 c = 0;
+        if (newBalanceFrom > 0 && Ann > 0) {
+            // Calculate step by step to avoid overflow
+            uint256 term1 = D * D;
+            uint256 term2 = newBalanceFrom * Ann;
+            if (term2 > 0) {
+                c = ((term1 / term2) * D) / 2;
+            }
         }
-        
+
         // Then, solve for y (balance of output token)
         uint256 b = newBalanceFrom + D / Ann;
         uint256 yPrev;
         uint256 y = D;
-        
-        // Iteratively find y using Newton's method with overflow protection
-        for (uint256 i = 0; i < MAX_ITERATIONS;) {
+
+        // Iteratively find y using Newton's method
+        for (uint256 i = 0; i < MAX_ITERATIONS; ) {
             yPrev = y;
-            
-            // Modified formula to prevent overflow
-            // Original: y = (y^2 + c) / (2 * y + b - D)
-            if (y == 0) {
-                // Prevent division by zero
-                y = 1;
-            } else {
-                uint256 numerator = y * y + c;
-                uint256 denominator = 2 * y + b;
-                
-                // Ensure denominator is not less than D to prevent underflow
-                if (denominator > D) {
-                    denominator = denominator - D;
+
+            // Formula: y = (y^2 + c) / (2 * y + b - D)
+            if (y > 0) {
+                uint256 y_squared = y * y;
+                uint256 numerator = y_squared + c;
+                uint256 denominator = 2 * y + b - D;
+
+                if (denominator > 0) {
                     y = numerator / denominator;
                 } else {
-                    // If denominator would be negative, use a different approach
-                    y = numerator / (denominator + 1);
-                }
-            }
-            
-            // Check if we've converged
-            if (y > yPrev) {
-                if (y - yPrev <= 1) {
-                    break;
+                    // If denominator would be negative, use a fallback
+                    y = numerator / (2 * y + 1);
                 }
             } else {
-                if (yPrev - y <= 1) {
+                // If y becomes zero, use a small value to continue
+                y = 1;
+            }
+
+            // Check if we've converged
+            if (i > 0) {
+                // Skip first iteration check
+                uint256 diff = (y > yPrev) ? (y - yPrev) : (yPrev - y);
+                if (diff <= 1) {
                     break;
                 }
             }
-            
-            unchecked { ++i; }
+
+            unchecked {
+                ++i;
+            }
         }
-        
-        // Ensure the new y value maintains the invariant
+
+        // Ensure the new y value is valid
         if (y > balances[tokenIndexTo]) revert OutputExceedsBalance();
-        
+
         return balances[tokenIndexTo] - y;
     }
-    
+
     /**
-     * @notice Calculate the amount of LP tokens to mint when adding liquidity
-     * @dev Computes the amount of LP tokens to mint based on the change in invariant
+     * @notice Calculate LP tokens to mint when adding liquidity
      * @param oldInvariant Previous invariant value
      * @param newInvariant New invariant value after adding liquidity
      * @param totalSupply Current supply of LP tokens
@@ -198,30 +239,32 @@ library StableMath {
         uint256 totalSupply
     ) public pure returns (uint256) {
         if (totalSupply == 0) {
-            return newInvariant;  // Initial mint
+            return newInvariant; // Initial mint
         }
-        
-        // Safe calculation for proportional share based on invariant growth
-        if (newInvariant <= oldInvariant) return 0; // No growth, no mint
-        
+
+        // No mint if no growth
+        if (newInvariant <= oldInvariant) return 0;
+
+        // Calculate proportional share based on invariant growth
         return (totalSupply * (newInvariant - oldInvariant)) / oldInvariant;
     }
-    
+
     /**
      * @notice Calculate fee amount
-     * @dev Calculates the fee amount for a given swap
      * @param amount Amount being swapped
      * @param fee Fee rate in PRECISION precision (e.g., 0.04% = 4e4)
      * @return Fee amount
      */
-    function calculateFee(uint256 amount, uint256 fee) public pure returns (uint256) {
-        return (amount * fee) / PRECISION;
+    function calculateFee(
+        uint256 amount,
+        uint256 fee
+    ) public pure returns (uint256) {
+        return mulDown(amount, fee);
     }
-    
+
     /**
      * @notice Calculates the spot price of the token pair
-     * @dev Spot price is the instantaneous exchange rate at current pool state
-     * @param balances Current balances of both tokens
+     * @param balances Current balances of both tokens (already scaled)
      * @param amplification Amplification coefficient
      * @return Spot price as a fixed-point number with PRECISION
      */
@@ -229,31 +272,47 @@ library StableMath {
         uint256[2] memory balances,
         uint256 amplification
     ) public pure returns (uint256) {
-        // Handle edge cases to prevent overflow
         if (balances[0] == 0 || balances[1] == 0) return 0;
-        
+
         uint256 D = calculateInvariant(balances, amplification);
         uint256 Ann = amplification * 2;
-        
-        // Calculate with overflow protection
         uint256 nA = Ann / A_PRECISION;
-        uint256 x = balances[0];
-        uint256 y = balances[1];
-        
-        uint256 numerator = x * PRECISION;
-        uint256 denominator = y;
-        
-        // Apply the amplification effect with overflow protection
+
+        // Safe calculations for spot price
+        if (nA == 0 || D == 0) return 0;
+
         // For a 2-token pool, spot price = x/y * (1 + D/(4*A*x*y))
-        uint256 fraction;
-        if (nA > 0 && x > 0 && y > 0) {
-            fraction = (D * PRECISION) / (4 * nA * x * y);
-        } else {
-            fraction = 0;
+
+        // Calculate basic ratio: x/y
+        uint256 baseRatio = divDown(balances[0], balances[1]);
+
+        // Calculate amplification effect: D/(4*A*x*y)
+        uint256 xy = balances[0] * balances[1];
+        if (xy == 0) return baseRatio; // Prevent division by zero
+
+        uint256 ampEffect = divDown(D, 4 * nA * xy);
+
+        // Final price: x/y * (1 + D/(4*A*x*y))
+        return mulDown(baseRatio, PRECISION + ampEffect);
+    }
+
+    /**
+     * @notice Calculate the square root of a number
+     * @dev Uses Babylonian method for square root approximation
+     * @param x The number to calculate the square root of
+     * @return y The square root of x
+     */
+    function sqrt(uint256 x) public pure returns (uint256 y) {
+        if (x == 0) return 0;
+
+        // Initial guess: x/2
+        uint256 z = (x + 1) / 2;
+        y = x;
+
+        // Babylonian method for square root
+        while (z < y) {
+            y = z;
+            z = (x / z + z) / 2;
         }
-        
-        uint256 adjustmentFactor = PRECISION + fraction;
-        
-        return (numerator * adjustmentFactor) / (denominator * PRECISION);
     }
 }
