@@ -130,17 +130,6 @@ npx hardhat node
 npx hardhat run scripts/deploy.js --network localhost
 ```
 
-### 🎯 **Live on Testnets**
-
-<div align="center">
-
-| Network | Status | Contract Address | Explorer |
-|:---:|:---:|:---:|:---:|
-| 🔸 **Sepolia** | ✅ Live | `0x742d35Cc6639C0532fEb68525F3AA283D7caDBfA` | [View →](https://sepolia.etherscan.io) |
-| 🟣 **Polygon Mumbai** | ⏳ Soon | `Coming Soon` | [View →](https://mumbai.polygonscan.com) |
-| 🔷 **Arbitrum Goerli** | ⏳ Soon | `Coming Soon` | [View →](https://goerli.arbiscan.io) |
-
-</div>
 
 ---
 
