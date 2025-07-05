@@ -14,7 +14,7 @@ import "./LPToken.sol";
  * @notice Factory for creating StableSwap pools with liquidity mining rewards
  * @dev Size-optimized implementation with added staking functionality
  * @author MahmoudKebbi
- * date 2025-07-04 18:57:43
+ * 
  */
 contract StableSwapFactory is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;

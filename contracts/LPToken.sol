@@ -55,14 +55,13 @@ contract LPToken is ERC20, Ownable {
      * @param to Recipient address
      * @param amount Amount of tokens being transferred
      */
-    function _update(
-        address from,
-        address to,
-        uint256 amount
-    ) internal override {
-        if (to == address(0)) revert NotAuthorized();
-        super._update(from, to, amount);
-    }
+function _update(
+    address from,
+    address to,
+    uint256 amount
+) internal override {
+    super._update(from, to, amount);
+}
     
     /**
      * @notice Transfer tokens and call the receiver's onTokenTransfer function
