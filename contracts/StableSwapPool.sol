@@ -33,10 +33,10 @@ contract StableSwapPool is ReentrancyGuard, Ownable, Pausable, ERC677Receiver {
     using SafeERC20 for IERC20;
 
     // Constants
-    uint256 private constant PRECISION = 1e6;
+    uint256 private constant PRECISION = 1e6; // Changed from 1e18 to match StableMath
     uint256 private constant A_PRECISION = 100;
-    uint256 private constant MAX_A = 10000;
-    uint256 private constant MAX_FEE = 1e5;
+    uint256 private constant MAX_A = 10000; // Reduced maximum allowed amplification
+    uint256 private constant MAX_FEE = 1e5; // Maximum fee: 10% (in 1e6 precision)
     uint256 private constant OLD_PRECISION = 1e18; // For auto-conversion of fee parameters
     uint256 private constant MIN_RAMP_TIME = 1 days; // Minimum time for A value changes
     uint256 private constant MAX_PROTOCOL_FEE_SHARE = 5000; // Maximum protocol fee: 50%
@@ -359,54 +359,49 @@ contract StableSwapPool is ReentrancyGuard, Ownable, Pausable, ERC677Receiver {
         return lpAmount;
     }
 
-    function removeLiquidity(
-        uint256 lpAmount,
-        uint256 minAmount0,
-        uint256 minAmount1,
-        uint256 deadline
-    )
-        public
-        nonReentrant
-        whenNotPaused
-        returns (uint256 amount0, uint256 amount1)
-    {
-        if (!initialized) revert NotInitialized();
-        if (block.timestamp > deadline) revert DeadlineExpired();
-        if (lpAmount == 0) revert ZeroAmount();
+  function removeLiquidity(
+    uint256 lpAmount,
+    uint256 minAmount0,
+    uint256 minAmount1,
+    uint256 deadline
+) public nonReentrant whenNotPaused returns (uint256 amount0, uint256 amount1) {
+    if (!initialized) revert NotInitialized();
+    if (block.timestamp > deadline) revert DeadlineExpired();
+    if (lpAmount == 0) revert ZeroAmount();
 
-        // Update the amplification coefficient if it's changing
-        _updateAmplification();
+    // Update the amplification coefficient if it's changing
+    _updateAmplification();
 
-        // Update price accumulator
-        _updatePriceAccumulator();
+    // Update price accumulator
+    _updatePriceAccumulator();
 
-        uint256 totalSupply = lpToken.totalSupply();
+    uint256 totalSupply = lpToken.totalSupply();
 
-        // Calculate token amounts to return based on proportional share
-        amount0 = (balances[0] * lpAmount) / totalSupply;
-        amount1 = (balances[1] * lpAmount) / totalSupply;
+    // Calculate token amounts to return based on proportional share
+    amount0 = (balances[0] * lpAmount) / totalSupply;
+    amount1 = (balances[1] * lpAmount) / totalSupply;
 
-        // Check minimum amounts
-        if (amount0 < minAmount0 || amount1 < minAmount1)
-            revert SlippageTooHigh();
+    // Check minimum amounts
+    if (amount0 < minAmount0 || amount1 < minAmount1)
+        revert SlippageTooHigh();
 
-        // Update balances
-        balances[0] -= amount0;
-        balances[1] -= amount1;
+    // Update balances
+    balances[0] -= amount0;
+    balances[1] -= amount1;
 
-        // First transfer LP tokens to the pool
-        lpToken.transferFrom(msg.sender, address(this), lpAmount);
+    // First transfer LP tokens to the pool
+    lpToken.transferFrom(msg.sender, address(this), lpAmount);
+    
+    // Then burn from the pool's own balance
+    lpToken.burn(address(this), lpAmount);
 
-        // Then burn from the pool's own balance
-        lpToken.burn(address(this), lpAmount);
+    // Transfer tokens to user
+    IERC20(address(token0)).safeTransfer(msg.sender, amount0);
+    IERC20(address(token1)).safeTransfer(msg.sender, amount1);
 
-        // Transfer tokens to user
-        IERC20(address(token0)).safeTransfer(msg.sender, amount0);
-        IERC20(address(token1)).safeTransfer(msg.sender, amount1);
-
-        emit RemoveLiquidity(msg.sender, amount0, amount1, lpAmount);
-        return (amount0, amount1);
-    }
+    emit RemoveLiquidity(msg.sender, amount0, amount1, lpAmount);
+    return (amount0, amount1);
+}
 
     /**
      * @notice Perform a token swap

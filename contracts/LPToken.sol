@@ -48,20 +48,7 @@ contract LPToken is ERC20, Ownable {
         _burn(from, amount);
     }
 
-    /**
-     * @notice Prevents token transfers to the zero address
-     * @dev Overrides the ERC20 _beforeTokenTransfer hook
-     * @param from Sender address
-     * @param to Recipient address
-     * @param amount Amount of tokens being transferred
-     */
-function _update(
-    address from,
-    address to,
-    uint256 amount
-) internal override {
-    super._update(from, to, amount);
-}
+
     
     /**
      * @notice Transfer tokens and call the receiver's onTokenTransfer function
